@@ -7,6 +7,7 @@ import os
 import random
 import sys
 import time
+from argparse import ArgumentParser
 from collections import defaultdict
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from parser_v2.services.sheets_lock import SheetsLock
 
 load_dotenv(ROOT / ".env")
 load_dotenv(ROOT / "houses_v1" / ".env")
-CREDS = ROOT.parent / "olx-parser" / "ads-collector" / "real-estate-platform-484610-a5a172df3957.json"
+CREDS = Path(os.getenv("GOOGLE_CREDENTIALS_FILE", ROOT.parent / "olx-parser" / "ads-collector" / "real-estate-platform-484610-a5a172df3957.json"))
 BOOKS = {
     "apartments": (os.getenv("ACTIVE_SHEET_ID", "1RY4BiRospnPYLFoW2LLJleDgi08yomwhtUlKKvSpkr8"), {"rent": "Оренда", "buy": "Продаж"}),
     "houses": (os.getenv("HOUSES_ACTIVE_SHEET_ID", ""), {"rent": "Оренда", "buy": "Продаж"}),
@@ -80,17 +81,32 @@ def indexes(ws, catalog: str):
             retry(lambda: ws.add_cols(required_columns - ws.col_count))
         retry(lambda: ws.update(range_name=f"{column_name(start)}1:{column_name(start + len(missing)-1)}1", values=[missing], value_input_option="USER_ENTERED"))
         header += missing
-    if "ID" not in header:
+    key = "Ext ID" if "Ext ID" in header else "ID"
+    if key not in header:
         raise RuntimeError(f"{ws.title}: missing ID column")
-    return header.index("ID") + 1, {"ua": header.index("Telegraph UA") + 1, "en": header.index("Telegraph EN") + 1}
+    return header.index(key) + 1, {"ua": header.index("Telegraph UA") + 1, "en": header.index("Telegraph EN") + 1}
 
 
-def pending(cur):
-    cur.execute("""
-        SELECT catalog,listing_id,ua_url,en_url FROM block3.publications
-        WHERE status='published' AND (synced_at IS NULL OR updated_at > synced_at)
-        ORDER BY updated_at,catalog,listing_id
-    """)
+def pending(cur, include_synced: bool = False):
+    query = """
+        SELECT p.catalog, p.listing_id, p.ua_url, p.en_url,
+               COALESCE(apartment.external_id, house.external_id, commercial.external_id) AS sheet_key
+        FROM block3.publications p
+        LEFT JOIN active_listings apartment
+          ON p.catalog='apartments' AND apartment.id=p.listing_id AND apartment.status='active'
+        LEFT JOIN houses_listings house
+          ON p.catalog='houses' AND house.id=p.listing_id AND house.status='active'
+        LEFT JOIN commercial_listings commercial
+          ON p.catalog='commercial' AND commercial.id=p.listing_id AND commercial.status='active'
+        WHERE p.status='published'
+          AND COALESCE(apartment.id, house.id, commercial.id) IS NOT NULL
+    """
+    if not include_synced:
+        query += " AND (p.synced_at IS NULL OR p.updated_at > p.synced_at)"
+    query += """
+        ORDER BY p.updated_at,p.catalog,p.listing_id
+    """
+    cur.execute(query)
     items = []
     for row in cur.fetchall():
         for locale, url in (("ua", row["ua_url"]), ("en", row["en_url"])):
@@ -104,33 +120,44 @@ def sync_group(cur, client, catalog, operation, items):
     id_column, outputs = indexes(ws, catalog)
     ids = retry(lambda: ws.col_values(id_column))
     rows = {str(value).strip(): number for number, value in enumerate(ids[1:], 2) if str(value).strip()}
-    updates, rejected = [], []
+    existing = {
+        locale: retry(lambda locale=locale: ws.col_values(outputs[locale]))
+        for locale in ("ua", "en")
+    }
+    updates, unchanged, rejected = [], [], []
     for item in items:
-        row = rows.get(str(item["listing_id"]))
+        row = rows.get(str(item["sheet_key"]).strip())
         if row is None:
             rejected.append(item)
         else:
-            updates.append((item, {"range": f"{column_name(outputs[item['locale']])}{row}", "values": [[item["url"]]]}))
-    for start in range(0, len(updates), 100):
-        chunk = updates[start:start + 100]
+            current = existing[item["locale"]][row - 1] if len(existing[item["locale"]]) >= row else ""
+            if current.strip() == item["url"]:
+                unchanged.append(item)
+            else:
+                updates.append((item, {"range": f"{column_name(outputs[item['locale']])}{row}", "values": [[item["url"]]]}))
+    for start in range(0, len(updates), 500):
+        chunk = updates[start:start + 500]
         retry(lambda: ws.batch_update([change for _, change in chunk], value_input_option="USER_ENTERED"))
 
-    completed = {item["listing_id"] for item, _ in updates}
+    completed = {item["listing_id"] for item, _ in updates} | {item["listing_id"] for item in unchanged}
     rejected_ids = {item["listing_id"] for item in rejected}
     completed -= rejected_ids
     if completed:
         cur.execute("UPDATE block3.publications SET synced_at=now(),sync_error=NULL WHERE catalog=%s AND listing_id = ANY(%s)", (catalog, list(completed)))
     if rejected_ids:
-        cur.execute("UPDATE block3.publications SET sync_error='Active Sheet row was not found',synced_at=NULL WHERE catalog=%s AND listing_id = ANY(%s)", (catalog, list(rejected_ids)))
-    return len(updates), len(rejected)
+        cur.execute("UPDATE block3.publications SET synced_at=updated_at,sync_error=NULL WHERE catalog=%s AND listing_id = ANY(%s)", (catalog, list(rejected_ids)))
+    return {"written": len(updates), "unchanged": len(unchanged), "not_in_active_sheet": len(rejected)}
 
 
 def main():
+    parser = ArgumentParser()
+    parser.add_argument("--resync-all", action="store_true")
+    args = parser.parse_args()
     if not CREDS.is_file() or not COMMERCIAL.is_file():
         raise RuntimeError("Google Sheets configuration is incomplete")
     with psycopg2.connect(host=os.getenv("PG_HOST", "/tmp"), port=os.getenv("PG_PORT", "5432"), dbname=os.getenv("PG_DBNAME", "real_estate"), user=os.getenv("PG_USER", "admin"), password=os.getenv("PG_PASSWORD", "")) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            items = pending(cur)
+            items = pending(cur, include_synced=args.resync_all)
             groups = defaultdict(list)
 
             if items:
@@ -139,14 +166,15 @@ def main():
                 for item in items:
                     groups[(item["catalog"], operations[(item["catalog"], item["listing_id"])])].append(item)
             client = gspread.authorize(Credentials.from_service_account_file(str(CREDS), scopes=["https://www.googleapis.com/auth/spreadsheets"]))
-            result = {"synced_cells": 0, "rejected_cells": 0, "groups": {}}
+            result = {"written_cells": 0, "unchanged_cells": 0, "not_in_active_sheet_cells": 0, "groups": {}, "resync_all": args.resync_all}
             try:
                 with SheetsLock("block3_sync_to_sheets"):
                     for key, group in groups.items():
-                        synced, rejected = sync_group(cur, client, *key, group)
-                        result["synced_cells"] += synced
-                        result["rejected_cells"] += rejected
-                        result["groups"][":".join(key)] = {"synced": synced, "rejected": rejected}
+                        outcome = sync_group(cur, client, *key, group)
+                        result["written_cells"] += outcome["written"]
+                        result["unchanged_cells"] += outcome["unchanged"]
+                        result["not_in_active_sheet_cells"] += outcome["not_in_active_sheet"]
+                        result["groups"][":".join(key)] = outcome
             except RuntimeError as error:
                 if not str(error).startswith("Sheets writer already running:"):
                     raise
